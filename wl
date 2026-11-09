@@ -36,6 +36,7 @@ DEFAULT_CONFIG = {
     "auto_transition": True,     # move To Do -> In Progress when a branch is checked out
     "assign_to_me": True,        # assign unassigned issues to me on transition
     "insecure_ssl": False,       # set true only if Jira uses a corporate cert python rejects
+    "paused": "",                # "" | "jira" (log only) | "all" (hooks do nothing); see `wl pause`
     "repos": [],                 # repos registered by `wl install-hooks`
 }
 
@@ -514,6 +515,23 @@ def cmd_jira(args, cfg):
     if args and args[0] == "me":
         print(json.dumps(jira.myself(), indent=2)[:800])
         return
+    if args and args[0] == "transitions" and len(args) > 1:
+        key = args[1].upper()
+        c = fetch_issue(jira, key)
+        if c:
+            print("%s is '%s'. Available moves:" % (key, c["status"]))
+        for t in jira.transitions(key):
+            print("  %-28s -> %s" % (t.get("name"), (t.get("to") or {}).get("name")))
+        return
+    if args and args[0] == "move" and len(args) > 2:
+        key, target = args[1].upper(), " ".join(args[2:]).lower()
+        for t in jira.transitions(key):
+            if target in (t.get("name", "").lower(), (t.get("to") or {}).get("name", "").lower()):
+                jira.transition(key, t["id"])
+                c = fetch_issue(jira, key, quiet=True) or {}
+                print("%s -> %s" % (key, c.get("status") or (t.get("to") or {}).get("name")))
+                return
+        die("%s: no transition named '%s'. See `wl jira transitions %s`." % (key, target, key))
     for key in args:
         c = fetch_issue(jira, key.upper())
         if c:
@@ -526,6 +544,9 @@ def cmd_hook(args, cfg):
     try:
         kind = args[0]
         repo = os.getcwd()
+        if hook_disabled(cfg, repo, "all"):
+            return
+        jira_ok = cfg.get("auto_transition") and not hook_disabled(cfg, repo, "jira")
         branch = git(["symbolic-ref", "--short", "-q", "HEAD"], cwd=repo)
         keys = keys_in(branch)
         if kind == "post-checkout":
@@ -540,9 +561,10 @@ def cmd_hook(args, cfg):
                 add_entry(day, key, source="branch", summary=cache.get(key, {}).get("summary"))
             save_day(day)
             log("post-checkout %s branch=%s new=%s" % (",".join(keys), branch, is_new))
-            if cfg.get("auto_transition") and Jira(cfg).configured:
+            if jira_ok and Jira(cfg).configured:
                 spawn_background(["jira-bg"] + keys)
-            print("worklog: noted %s%s" % (", ".join(keys), " (new branch)" if is_new else ""),
+            print("worklog: noted %s%s%s" % (", ".join(keys), " (new branch)" if is_new else "",
+                                              "" if jira_ok else " (jira untouched)"),
                   file=sys.stderr)
         elif kind == "post-commit":
             msg = git(["log", "-1", "--format=%s"], cwd=repo)
@@ -563,6 +585,25 @@ def cmd_hook(args, cfg):
                 spawn_background(["fetch-bg"] + missing)
     except Exception as e:  # never break git
         log("hook error: %r" % (e,))
+
+
+def hook_disabled(cfg, repo, what):
+    """what: "all" -> hook does nothing; "jira" -> log but never change Jira.
+
+    Checked in order: WL_SKIP / WL_NO_JIRA env vars (one command),
+    `wl pause` (until `wl resume`), `git config worklog.enabled|worklog.jira false` (per repo).
+    """
+    if what == "all":
+        if os.environ.get("WL_SKIP"):
+            return True
+        if cfg.get("paused") == "all":
+            return True
+        return git(["config", "--bool", "worklog.enabled"], cwd=repo) == "false"
+    if os.environ.get("WL_NO_JIRA") or os.environ.get("WL_SKIP"):
+        return True
+    if cfg.get("paused") in ("jira", "all"):
+        return True
+    return git(["config", "--bool", "worklog.jira"], cwd=repo) == "false"
 
 
 def spawn_background(argv):
@@ -701,6 +742,22 @@ def cmd_setup(cfg):
     cmd_config(["test"], cfg)
 
 
+def cmd_pause(args, cfg):
+    what = (args[0] if args else "jira").lower()
+    if what not in ("jira", "all"):
+        die("usage: wl pause [jira|all]   (jira = keep logging, stop touching Jira; all = hooks off)")
+    cfg["paused"] = what
+    save_config(cfg)
+    print("paused: %s. Resume with `wl resume`." % (
+        "Jira updates (branches are still logged)" if what == "jira" else "all hooks"))
+
+
+def cmd_resume(cfg):
+    cfg["paused"] = ""
+    save_config(cfg)
+    print("resumed: hooks log branches and update Jira again")
+
+
 # ---------------------------------------------------------------- reminder
 PLIST = """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -757,6 +814,14 @@ Reading:
   wl scan [DATE]           find tickets from git activity in registered repos
   wl sync                  add tickets assigned to you that Jira says were updated today
   wl jira KEY...           show Jira status;  wl jira start KEY  -> transition only
+  wl jira transitions KEY  list the moves Jira allows;  wl jira move KEY "To Do"  -> move it back
+
+Stopping the automation:
+  WL_NO_JIRA=1 git checkout -b feature/MAR-1-x   log the branch but leave Jira alone (this command only)
+  WL_SKIP=1 git checkout -b ...                  hooks do nothing for this command
+  wl pause [jira|all] / wl resume                until you resume (jira = default)
+  git config worklog.jira false                  never touch Jira from this repo (worklog.enabled false = hooks off)
+  wl config set auto_transition false            never touch Jira from anywhere
 
 Setup:
   wl setup                 enter Jira URL + Personal Access Token
@@ -811,6 +876,10 @@ def main(argv):
         cmd_setup(cfg)
     elif cmd == "remind":
         cmd_remind(args)
+    elif cmd == "pause":
+        cmd_pause(args, cfg)
+    elif cmd == "resume":
+        cmd_resume(cfg)
     else:
         die("unknown command '%s'\n%s" % (cmd, HELP))
 

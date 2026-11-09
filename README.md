@@ -119,6 +119,28 @@ wl config set in_progress_names '["In Progress","In Development"]'
 wl config set insecure_ssl true         # only if python rejects a corporate certificate
 ```
 
+### Stopping the automation when you don't want it
+
+Sometimes you want a branch without Jira noticing (a spike, a branch for a colleague's ticket,
+a quick experiment). From the narrowest to the widest switch:
+
+| Scope | How |
+|---|---|
+| This one command, log the branch but leave Jira alone | `WL_NO_JIRA=1 git checkout -b feature/MAR-1-spike` |
+| This one command, hooks do nothing at all | `WL_SKIP=1 git checkout -b feature/MAR-1-spike` |
+| Until you say otherwise (default: Jira only, logging continues) | `wl pause` … `wl resume` (`wl pause all` turns the hooks off too) |
+| This repo never touches Jira | `git config worklog.jira false` (`git config worklog.enabled false` disables the hooks here) |
+| Never touch Jira from any repo | `wl config set auto_transition false` |
+
+Already moved a ticket by mistake? Put it back:
+
+```bash
+wl jira transitions MAR-12345      # shows the moves Jira allows from the current status
+wl jira move MAR-12345 "To Do"
+```
+
+Tip for zsh users: `alias gcbn='WL_NO_JIRA=1 git checkout -b'` gives you a one-word opt-out.
+
 Data lives in `~/.local/share/worklog/days/<date>.json`, one small JSON file per day.
 Debug log: `~/.local/share/worklog/wl.log`.
 
