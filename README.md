@@ -19,10 +19,10 @@ Blockers:
 
 It fixes two habits:
 
-1. **Jira never knows you started.** When you check out a branch whose name contains a
-   ticket key (`feature/MAR-45531-rn-upgrade`), a git hook moves the ticket from *To Do*
-   to *In Progress* in Jira and assigns it to you if it is unassigned. Tickets already in
-   progress are left alone, so switching branches is harmless.
+1. **Jira never knows you started.** When you **create** a branch whose name contains a
+   ticket key (`git checkout -b feature/MAR-45531-rn-upgrade`), a git hook moves the ticket
+   from *To Do* to *In Progress* in Jira and assigns it to you if it is unassigned.
+   Switching to a branch that already exists never touches Jira.
 2. **You forget what you touched.** Every branch checkout and commit adds the ticket to
    today's log. Things without a branch (PR reviews, validation, meetings) you add with one
    line. `wl report` prints the form above, ready to paste.
@@ -83,13 +83,26 @@ wl install-hooks
 
 That's it. From now on `git checkout -b feature/MAR-12345-thing` logs the ticket and moves it in Jira.
 
+### When Jira is updated, and when it is not
+
+| Command | Daily log | Jira |
+|---|---|---|
+| `git checkout -b feature/MAR-123-x` or `git switch -c feature/MAR-123-x` | logged | To Do → In Progress, assigned to you if unassigned |
+| `git checkout feature/MAR-123-x` (branch already exists locally) | logged | untouched |
+| `git checkout feature/MAR-123-x` (first local copy of a branch that is already on the remote, e.g. a colleague's) | logged | untouched |
+| `git branch feature/MAR-123-x` now, check it out later | logged on checkout | untouched (use `wl start MAR-123`) |
+
+Each created branch triggers Jira exactly once. A ticket that is already past *To Do* is never moved.
+Prefer the old behaviour, where every switch can start a ticket? `wl config set jira_trigger any_checkout`.
+
 ---
 
 ## Daily use
 
 | You did | Command |
 |---|---|
-| Created / switched to a ticket branch | nothing, the hook logs it |
+| Created a ticket branch | nothing, the hook logs it and starts it in Jira |
+| Switched to an existing ticket branch | nothing, the hook logs it (Jira untouched) |
 | Reviewed a PR, tested something, no branch | `wl add MAR-49126 PR comments for modernized hook` |
 | Started a task without a branch | `wl start MAR-45531 Review RN upgrade` (logs + Jira In Progress) |
 | Finished something today | `wl done MAR-49126` |

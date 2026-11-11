@@ -24,6 +24,7 @@ DATA_DIR = os.path.join(HOME, ".local", "share", "worklog")
 DAYS_DIR = os.path.join(DATA_DIR, "days")
 CACHE_FILE = os.path.join(DATA_DIR, "issues.json")
 LOG_FILE = os.path.join(DATA_DIR, "wl.log")
+SEEN_FILE = os.path.join(DATA_DIR, "created_branches.json")
 KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,9}-\d+)\b")
 MARKER = "# >>> worklog hook (managed by wl) >>>"
 
@@ -33,7 +34,9 @@ DEFAULT_CONFIG = {
     "jira_user": "",             # optional: basic auth user (if no PAT)
     "jira_password": "",         # optional: basic auth password (if no PAT)
     "in_progress_names": ["In Progress", "In Development", "Development", "Start Progress"],
-    "auto_transition": True,     # move To Do -> In Progress when a branch is checked out
+    "auto_transition": True,     # move To Do -> In Progress from the post-checkout hook
+    "jira_trigger": "new_branch",  # "new_branch": only `git checkout -b` / `git switch -c`;
+                                   # "any_checkout": also when switching to an existing branch
     "assign_to_me": True,        # assign unassigned issues to me on transition
     "insecure_ssl": False,       # set true only if Jira uses a corporate cert python rejects
     "paused": "",                # "" | "jira" (log only) | "all" (hooks do nothing); see `wl pause`
@@ -553,19 +556,23 @@ def cmd_hook(args, cfg):
             # args: prev new flag ; flag==1 means a branch checkout (not a file checkout)
             if len(args) < 4 or args[3] != "1" or not keys:
                 return
-            new_branch = git(["reflog", "show", "--format=%gd", "refs/heads/" + branch], cwd=repo)
-            is_new = len(new_branch.splitlines()) <= 1
+            is_new = branch_just_created(repo, branch)
+            touch_jira = bool(jira_ok and (is_new or cfg.get("jira_trigger") == "any_checkout"))
             day = load_day(date.today())
             cache = issue_cache()
             for key in keys:
                 add_entry(day, key, source="branch", summary=cache.get(key, {}).get("summary"))
             save_day(day)
-            log("post-checkout %s branch=%s new=%s" % (",".join(keys), branch, is_new))
-            if jira_ok and Jira(cfg).configured:
+            log("post-checkout %s branch=%s new=%s jira=%s" % (",".join(keys), branch, is_new, touch_jira))
+            if touch_jira and Jira(cfg).configured:
                 spawn_background(["jira-bg"] + keys)
-            print("worklog: noted %s%s%s" % (", ".join(keys), " (new branch)" if is_new else "",
-                                              "" if jira_ok else " (jira untouched)"),
-                  file=sys.stderr)
+            if touch_jira:
+                what = " (new branch, Jira -> In Progress)" if is_new else " (Jira -> In Progress)"
+            elif is_new:
+                what = " (new branch, jira untouched)"
+            else:
+                what = ""
+            print("worklog: noted %s%s" % (", ".join(keys), what), file=sys.stderr)
         elif kind == "post-commit":
             msg = git(["log", "-1", "--format=%s"], cwd=repo)
             for k in keys_in(msg):
@@ -585,6 +592,42 @@ def cmd_hook(args, cfg):
                 spawn_background(["fetch-bg"] + missing)
     except Exception as e:  # never break git
         log("hook error: %r" % (e,))
+
+
+def branch_just_created(repo, branch):
+    """True only for a branch that this checkout created (`git checkout -b`, `git switch -c`).
+
+    False when switching to a branch that already existed locally, and false when the
+    checkout only made a local copy of a branch that already exists on a remote
+    (someone else's branch, or your own from another machine).
+    """
+    ref = "refs/heads/" + branch
+    # the branch's own reflog has exactly one entry: its creation
+    entries = git(["reflog", "show", "--date=unix", "--format=%gd", ref], cwd=repo).splitlines()
+    if len(entries) != 1:
+        return False
+    # ...and that creation happened just now, not earlier via `git branch NAME`
+    m = re.search(r"@\{(\d+)\}", entries[0])
+    try:
+        window = int(os.environ.get("WL_NEW_WINDOW", "30"))
+    except ValueError:
+        window = 30
+    if not m or abs(datetime.now().timestamp() - int(m.group(1))) > window:
+        return False
+    # ...and no remote already has a branch with this name
+    for remote in git(["remote"], cwd=repo).split():
+        if git(["rev-parse", "--verify", "--quiet", "refs/remotes/%s/%s" % (remote, branch)], cwd=repo):
+            return False
+    # ...and this creation was not already handled (switching away and straight back)
+    seen = load_json(SEEN_FILE, {})
+    key = "%s\t%s" % (git(["rev-parse", "--show-toplevel"], cwd=repo) or repo, branch)
+    if seen.get(key) == m.group(1):
+        return False
+    cutoff = datetime.now().timestamp() - 30 * 86400
+    seen = {k: v for k, v in seen.items() if int(v) > cutoff}
+    seen[key] = m.group(1)
+    save_json(SEEN_FILE, seen)
+    return True
 
 
 def hook_disabled(cfg, repo, what):
@@ -815,6 +858,10 @@ Reading:
   wl sync                  add tickets assigned to you that Jira says were updated today
   wl jira KEY...           show Jira status;  wl jira start KEY  -> transition only
   wl jira transitions KEY  list the moves Jira allows;  wl jira move KEY "To Do"  -> move it back
+
+Jira is only updated when the hook sees a branch being created (git checkout -b / git switch -c).
+Switching to an existing branch only logs the ticket. `wl config set jira_trigger any_checkout`
+restores updating on every switch.
 
 Stopping the automation:
   WL_NO_JIRA=1 git checkout -b feature/MAR-1-x   log the branch but leave Jira alone (this command only)
