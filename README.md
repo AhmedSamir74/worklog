@@ -24,9 +24,10 @@ It fixes two habits:
    to its "in development" status in Jira and assigns it to you if it is unassigned. It only
    does so when the ticket is in the expected starting status for its type (see
    [Transition rules](#transition-rules)). Switching to an existing branch never touches Jira.
-2. **You forget what you touched.** Every branch checkout and commit adds the ticket to
-   today's log. Things without a branch (PR reviews, validation, meetings) you add with one
-   line. `wl report` prints the form above, ready to paste.
+2. **You forget what you touched.** Creating a ticket branch, and every commit you make on
+   one, adds the ticket to today's log. Just checking out a branch (to review a PR) adds
+   nothing. Work without commits (PR reviews, validation, meetings) you add with one line.
+   `wl report` prints the form above, ready to paste.
 
 Requirements: macOS or Linux, git, python3 (stdlib only, no pip). Jira Server / Data Center
 with a Personal Access Token (Jira Cloud also works with `jira_user` + `jira_password` = API token).
@@ -84,16 +85,18 @@ wl install-hooks
 
 That's it. From now on `git checkout -b feature/MAR-12345-thing` logs the ticket and moves it in Jira.
 
-### When Jira is updated, and when it is not
+### What gets logged, and when Jira is updated
 
 | Command | Daily log | Jira |
 |---|---|---|
 | `git checkout -b feature/MAR-123-x` or `git switch -c feature/MAR-123-x` | logged | moved per its [transition rule](#transition-rules), assigned to you if unassigned |
-| `git checkout feature/MAR-123-x` (branch already exists locally) | logged | untouched |
-| `git checkout feature/MAR-123-x` (first local copy of a branch that is already on the remote, e.g. a colleague's) | logged | untouched |
-| `git branch feature/MAR-123-x` now, check it out later | logged on checkout | untouched (use `wl start MAR-123`) |
+| `git checkout feature/MAR-123-x` (branch already exists locally) | not logged | untouched |
+| `git checkout feature/MAR-123-x` (first local copy of a branch that is already on the remote, e.g. a colleague's PR) | not logged | untouched |
+| `git branch feature/MAR-123-x` now, check it out later | not logged | untouched (use `wl start MAR-123`) |
+| `git commit` on any branch with a ticket key | logged | untouched |
 
-Each created branch triggers Jira exactly once.
+Each created branch triggers Jira exactly once. Reviewed someone's PR and want it in your status?
+`wl add MAR-123 PR review`. Want every checkout logged again? `wl config set log_trigger any_checkout`.
 
 ### Transition rules
 
@@ -132,13 +135,14 @@ Prefer the old behaviour, where every switch can start a ticket? `wl config set 
 | You did | Command |
 |---|---|
 | Created a ticket branch | nothing, the hook logs it and starts it in Jira |
-| Switched to an existing ticket branch | nothing, the hook logs it (Jira untouched) |
+| Committed on a ticket branch | nothing, the hook logs it |
+| Checked out a branch to review a PR | nothing is logged; `wl add MAR-49126 PR review` if it should count |
 | Reviewed a PR, tested something, no branch | `wl add MAR-49126 PR comments for modernized hook` |
 | Started a task without a branch | `wl start MAR-45531 Review RN upgrade` (logs + Jira In Progress) |
 | Finished something today | `wl done MAR-49126` |
 | Will start something tomorrow | `wl plan DF-25589` |
 | Got blocked | `wl block waiting on backend for X` (`wl block -` clears) |
-| Forgot to log all day | `wl scan` (reads today's git activity in your repos) |
+| Forgot to log all day | `wl scan` (branches you created and commits you made today) |
 | Want Jira's view too | `wl sync` (tickets assigned to you updated today) |
 | End of day | `wl report --copy` → paste into the form |
 

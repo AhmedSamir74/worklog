@@ -45,6 +45,9 @@ DEFAULT_CONFIG = {
     },
     "in_progress_names": ["In Progress", "In Development", "Development", "Start Progress"],
     "auto_transition": True,     # move To Do -> In Progress from the post-checkout hook
+    "log_trigger": "new_branch",   # what adds a ticket to the daily log from a checkout:
+                                   # "new_branch": only creating a branch (commits always count);
+                                   # "any_checkout": also switching to an existing branch
     "jira_trigger": "new_branch",  # "new_branch": only `git checkout -b` / `git switch -c`;
                                    # "any_checkout": also when switching to an existing branch
     "assign_to_me": True,        # assign unassigned issues to me on transition
@@ -497,41 +500,51 @@ def cmd_report(args, cfg):
 
 
 def cmd_scan(args, cfg):
-    """Derive today's tickets from the git reflogs/commits of registered repos."""
+    """Derive a day's tickets from git: branches I created and commits I made.
+
+    Branches that were only checked out (PR reviews) are ignored unless log_trigger=any_checkout.
+    """
     d = parse_date(args[0] if args and not args[0].startswith("-") else None)
     day = load_day(d)
     jira = Jira(cfg)
     cache = issue_cache()
     found = {}
-    me = git(["config", "user.email"])
     for repo in cfg.get("repos", []):
         if not os.path.isdir(repo):
             continue
-        # branch checkouts that day
-        out = git(["log", "-g", "--date=short", "--format=%gd%x09%gs", "HEAD"], cwd=repo)
-        for line in out.splitlines():
-            if ("{%s" % d.isoformat()) not in line:
+        me = git(["config", "user.email"], cwd=repo)
+        day_tag = "{%s" % d.isoformat()
+        if cfg.get("log_trigger") == "any_checkout":
+            # every branch switched to that day
+            out = git(["log", "-g", "--date=short", "--format=%gd%x09%gs", "HEAD"], cwd=repo)
+            for line in out.splitlines():
+                if day_tag in line:
+                    for key in keys_in(line):
+                        found.setdefault(key, set()).add("branch")
+        # branches created that day (not local copies of a branch that came from a remote)
+        names = git(["for-each-ref", "--format=%(refname:short)", "refs/heads"], cwd=repo).splitlines()
+        for name in names:
+            if not keys_in(name):
                 continue
-            for key in keys_in(line):
+            entries = git(["reflog", "show", "--date=short", "--format=%gd%x09%gs",
+                           "refs/heads/" + name], cwd=repo).splitlines()
+            if not entries or day_tag not in entries[-1]:
+                continue
+            origin = entries[-1].partition("\t")[2]
+            if not origin.startswith("branch: Created from") or origin.endswith("/" + name):
+                continue
+            for key in keys_in(name):
                 found.setdefault(key, set()).add("branch")
-        # commits that day on local branches
+        # my commits that day on local branches; ticket from the subject, else from the branch
         since = d.isoformat() + " 00:00"
         until = (d + timedelta(days=1)).isoformat() + " 00:00"
         extra = ["--author=" + me] if me else []
         out = git(["log", "--branches", "--since=" + since, "--until=" + until,
-                   "--format=%H%x09%s%x09%D"] + extra, cwd=repo)
+                   "--format=%s%x09%S"] + extra, cwd=repo)
         for line in out.splitlines():
-            parts = line.split("\t")
-            for key in keys_in(" ".join(parts[1:])):
+            subject, _, source = line.partition("\t")
+            for key in keys_in(subject) or keys_in(source):
                 found.setdefault(key, set()).add("commit")
-        # branches whose tip commit is from that day (commit messages without a key)
-        out = git(["for-each-ref", "--format=%(refname:short)%x09%(committerdate:short)",
-                   "refs/heads"], cwd=repo)
-        for line in out.splitlines():
-            name, _, cdate = line.partition("\t")
-            if cdate == d.isoformat():
-                for key in keys_in(name):
-                    found.setdefault(key, set()).add("commit")
     for key, sources in found.items():
         cached = cache.get(key) or fetch_issue(jira, key, quiet=True)
         for s in sorted(sources):
@@ -617,21 +630,29 @@ def cmd_hook(args, cfg):
                 return
             is_new = branch_just_created(repo, branch)
             touch_jira = bool(jira_ok and (is_new or cfg.get("jira_trigger") == "any_checkout"))
-            day = load_day(date.today())
-            cache = issue_cache()
-            for key in keys:
-                add_entry(day, key, source="branch", summary=cache.get(key, {}).get("summary"))
-            save_day(day)
-            log("post-checkout %s branch=%s new=%s jira=%s" % (",".join(keys), branch, is_new, touch_jira))
+            # Just switching to a branch (e.g. to review a PR) is not work on its ticket.
+            do_log = is_new or cfg.get("log_trigger") == "any_checkout"
+            log("post-checkout %s branch=%s new=%s logged=%s jira=%s" % (
+                ",".join(keys), branch, is_new, do_log, touch_jira))
+            if do_log:
+                day = load_day(date.today())
+                cache = issue_cache()
+                for key in keys:
+                    add_entry(day, key, source="branch", summary=cache.get(key, {}).get("summary"))
+                save_day(day)
             if touch_jira and Jira(cfg).configured:
                 spawn_background(["jira-bg"] + keys)
+            if not do_log and not touch_jira:
+                return
+            notes = []
+            if is_new:
+                notes.append("new branch")
             if touch_jira:
-                what = " (new branch, Jira -> In Progress)" if is_new else " (Jira -> In Progress)"
+                notes.append("starting it in Jira if its rule matches")
             elif is_new:
-                what = " (new branch, jira untouched)"
-            else:
-                what = ""
-            print("worklog: noted %s%s" % (", ".join(keys), what), file=sys.stderr)
+                notes.append("jira untouched")
+            print("worklog: %s %s%s" % ("noted" if do_log else "not logged:", ", ".join(keys),
+                                        " (%s)" % ", ".join(notes) if notes else ""), file=sys.stderr)
         elif kind == "post-commit":
             msg = git(["log", "-1", "--format=%s"], cwd=repo)
             for k in keys_in(msg):
@@ -926,7 +947,7 @@ Recording (today):
 Reading:
   wl log [DATE]            what was recorded (DATE: today, yesterday, 2026-11-05)
   wl report [DATE] [--copy] [--refresh]   print the end-of-day form (--copy -> clipboard)
-  wl scan [DATE]           find tickets from git activity in registered repos
+  wl scan [DATE]           find tickets from branches you created and commits you made
   wl sync                  add tickets assigned to you that Jira says were updated today
   wl jira KEY...           show Jira status;  wl jira start KEY  -> transition only
   wl jira transitions KEY  list the moves Jira allows;  wl jira move KEY "To Do"  -> move it back
@@ -934,10 +955,12 @@ Reading:
   wl rules                 show which ticket type moves from which status to which
   wl jira check KEY...     dry run: say what starting the ticket would do, change nothing
 
+A ticket enters the daily log when you create its branch or commit on it. Just checking out an
+existing branch (reviewing a PR) logs nothing; use `wl add KEY note` for review work.
 Jira is only updated when the hook sees a branch being created (git checkout -b / git switch -c),
 and only when the ticket matches its rule in `wl rules`; otherwise the ticket is not changed at all.
-Switching to an existing branch only logs the ticket. `wl config set jira_trigger any_checkout`
-restores updating on every switch.
+`wl config set log_trigger any_checkout` / `wl config set jira_trigger any_checkout` restore
+logging / Jira updates on every switch.
 
 Stopping the automation:
   WL_NO_JIRA=1 git checkout -b feature/MAR-1-x   log the branch but leave Jira alone (this command only)
