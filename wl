@@ -33,6 +33,16 @@ DEFAULT_CONFIG = {
     "jira_token": "",            # Personal Access Token (Jira Server/DC) -> Bearer
     "jira_user": "",             # optional: basic auth user (if no PAT)
     "jira_password": "",         # optional: basic auth password (if no PAT)
+    # Per ticket type: only move a ticket that is in `from`, and move it to `to`.
+    # Types without a rule are never changed. Names are matched case-insensitively.
+    # Set to {} to use the generic "To Do -> In Progress" behaviour (in_progress_names).
+    "transition_rules": {
+        "Story": {"from": "Ready For Development", "to": "In Development"},
+        "Bug": {"from": "Development Queue", "to": "In Development"},
+        "Incident": {"from": "Dev Queue", "to": "In Development"},
+        "Task": {"from": "Requests Queue", "to": "Task in progress"},
+        "Technical Change": {"from": "Ready For Development", "to": "In Development"},
+    },
     "in_progress_names": ["In Progress", "In Development", "Development", "Start Progress"],
     "auto_transition": True,     # move To Do -> In Progress from the post-checkout hook
     "jira_trigger": "new_branch",  # "new_branch": only `git checkout -b` / `git switch -c`;
@@ -154,7 +164,7 @@ class Jira:
             raise RuntimeError("Jira %s %s -> %s" % (method, path, e))
 
     def issue(self, key):
-        return self.call("GET", "/rest/api/2/issue/%s?fields=summary,status,assignee" % key)
+        return self.call("GET", "/rest/api/2/issue/%s?fields=summary,status,assignee,issuetype" % key)
 
     def myself(self):
         return self.call("GET", "/rest/api/2/myself")
@@ -184,6 +194,7 @@ def remember_issue(key, fields):
     cache[key] = {
         "summary": fields.get("summary", ""),
         "status": (fields.get("status") or {}).get("name", ""),
+        "type": (fields.get("issuetype") or {}).get("name", ""),
         "category": ((fields.get("status") or {}).get("statusCategory") or {}).get("key", ""),
         "fetched": datetime.now().isoformat(timespec="seconds"),
     }
@@ -205,58 +216,102 @@ def fetch_issue(jira, key, quiet=False):
         return None
 
 
-def start_in_jira(jira, cfg, key, quiet=False):
-    """Move key to In Progress if it is still in the To Do category; assign to me if unassigned."""
-    if not jira.configured:
+def norm(name):
+    return re.sub(r"[^a-z0-9]+", " ", (name or "").lower()).strip()
+
+
+def as_list(value):
+    if not value:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def rule_for(cfg, issue_type):
+    """The transition rule for a ticket type, or None when the type has no rule."""
+    rules = cfg.get("transition_rules") or {}
+    for name, rule in rules.items():
+        if name != "*" and norm(name) == norm(issue_type):
+            return rule
+    return rules.get("*")
+
+
+def plan_start(jira, cfg, key, fields):
+    """Decide what starting `key` should do. Returns (transition or None, reason)."""
+    status = (fields.get("status") or {}).get("name", "")
+    itype = (fields.get("issuetype") or {}).get("name", "")
+    tag = "%s (%s)" % (key, itype or "?")
+    if cfg.get("transition_rules"):
+        rule = rule_for(cfg, itype)
+        if not rule:
+            return None, "%s: no rule for this ticket type; left alone" % tag
+        froms, targets = as_list(rule.get("from")), as_list(rule.get("to"))
+        if norm(status) not in [norm(f) for f in froms]:
+            return None, "%s is '%s'; only moved from '%s'; left alone" % (
+                tag, status, "' / '".join(froms))
+        wanted = [norm(t) for t in targets]
+        available = jira.transitions(key)
+        for t in available:
+            if norm((t.get("to") or {}).get("name")) in wanted:
+                return t, "%s: %s -> %s" % (tag, status, (t.get("to") or {}).get("name"))
+        return None, "%s is '%s' but Jira offers no move to '%s' (offered: %s); left alone" % (
+            tag, status, "' / '".join(targets),
+            ", ".join((t.get("to") or {}).get("name", "?") for t in available) or "none")
+    # generic mode (no rules): anything still in the To Do category -> In Progress
+    category = ((fields.get("status") or {}).get("statusCategory") or {}).get("key")
+    if category != "new":
+        return None, "%s already '%s'; nothing to do" % (tag, status)
+    wanted = [norm(n) for n in cfg.get("in_progress_names", [])]
+    available = jira.transitions(key)
+    for t in available:
+        if norm((t.get("to") or {}).get("name")) in wanted or norm(t.get("name")) in wanted:
+            return t, "%s: %s -> %s" % (tag, status, (t.get("to") or {}).get("name"))
+    for t in available:
+        if ((t.get("to") or {}).get("statusCategory") or {}).get("key") == "indeterminate":
+            return t, "%s: %s -> %s" % (tag, status, (t.get("to") or {}).get("name"))
+    return None, "%s: no transition to In Progress found (status %s)" % (tag, status)
+
+
+def start_in_jira(jira, cfg, key, quiet=False, dry_run=False):
+    """Start a ticket: move it per the transition rules and assign it to me if unassigned.
+
+    A ticket that does not match its rule is not changed at all (no move, no assignment).
+    """
+    def say(msg, err=False):
         if not quiet:
-            print("  Jira not configured; run `wl setup`.", file=sys.stderr)
+            print("  " + msg, file=sys.stderr if err else sys.stdout)
+
+    if not jira.configured:
+        say("Jira not configured; run `wl setup`.", err=True)
         return False
     try:
-        data = jira.issue(key)
-        fields = data.get("fields", {})
+        fields = jira.issue(key).get("fields", {})
         remember_issue(key, fields)
-        status = fields.get("status") or {}
-        category = (status.get("statusCategory") or {}).get("key")
-        changed = False
-        if cfg.get("assign_to_me") and not fields.get("assignee"):
-            me = jira.myself().get("name")
-            if me:
-                jira.assign(key, me)
-                changed = True
-                if not quiet:
-                    print("  %s assigned to %s" % (key, me))
-        if category == "new":
-            wanted = [n.lower() for n in cfg.get("in_progress_names", [])]
-            chosen = None
-            for t in jira.transitions(key):
-                name = (t.get("to") or {}).get("name", "")
-                if name.lower() in wanted or t.get("name", "").lower() in wanted:
-                    chosen = t
-                    break
-            if chosen is None:
-                for t in jira.transitions(key):
-                    if ((t.get("to") or {}).get("statusCategory") or {}).get("key") == "indeterminate":
-                        chosen = t
-                        break
-            if chosen is None:
-                msg = "%s: no transition to In Progress found (status %s)" % (key, status.get("name"))
-                log(msg)
-                if not quiet:
-                    print("  " + msg, file=sys.stderr)
-                return changed
-            jira.transition(key, chosen["id"])
-            fetch_issue(jira, key, quiet=True)
-            log("%s -> %s" % (key, (chosen.get("to") or {}).get("name")))
-            if not quiet:
-                print("  %s: %s -> %s" % (key, status.get("name"), (chosen.get("to") or {}).get("name")))
-            return True
-        if not quiet:
-            print("  %s already '%s'; nothing to do" % (key, status.get("name")))
-        return changed
+        transition, reason = plan_start(jira, cfg, key, fields)
+        if transition is None:
+            log(reason)
+            say(reason)
+            return False
+        assign = bool(cfg.get("assign_to_me") and not fields.get("assignee"))
+        if dry_run:
+            say("would do  " + reason + (" and assign it to you" if assign else ""))
+            return False
+        if assign:
+            try:
+                me = jira.myself().get("name")
+                if me:
+                    jira.assign(key, me)
+                    say("%s assigned to %s" % (key, me))
+            except RuntimeError as e:
+                log(str(e))
+                say("(jira) could not assign: " + str(e), err=True)
+        jira.transition(key, transition["id"])
+        fetch_issue(jira, key, quiet=True)
+        log(reason)
+        say(reason)
+        return True
     except RuntimeError as e:
         log(str(e))
-        if not quiet:
-            print("  (jira) " + str(e), file=sys.stderr)
+        say("(jira) " + str(e), err=True)
         return False
 
 
@@ -518,6 +573,10 @@ def cmd_jira(args, cfg):
     if args and args[0] == "me":
         print(json.dumps(jira.myself(), indent=2)[:800])
         return
+    if args and args[0] == "check":
+        for key in args[1:]:
+            start_in_jira(jira, cfg, key.upper(), dry_run=True)
+        return
     if args and args[0] == "transitions" and len(args) > 1:
         key = args[1].upper()
         c = fetch_issue(jira, key)
@@ -538,7 +597,7 @@ def cmd_jira(args, cfg):
     for key in args:
         c = fetch_issue(jira, key.upper())
         if c:
-            print("%-11s %-14s %s" % (key.upper(), c["status"], c["summary"]))
+            print("%-11s %-17s %-22s %s" % (key.upper(), c.get("type", ""), c["status"], c["summary"]))
 
 
 # -------------------------------------------------------------------- hooks
@@ -753,7 +812,7 @@ def cmd_config(args, cfg):
         key, value = args[1], " ".join(args[2:])
         if value.lower() in ("true", "false"):
             value = value.lower() == "true"
-        elif value.startswith("["):
+        elif value[:1] in ("[", "{"):
             value = json.loads(value)
         cfg[key] = value
         save_config(cfg)
@@ -783,6 +842,19 @@ def cmd_setup(cfg):
         cfg["jira_token"] = tok
     save_config(cfg)
     cmd_config(["test"], cfg)
+
+
+def cmd_rules(cfg):
+    rules = cfg.get("transition_rules") or {}
+    if not rules:
+        print("no rules: any ticket still in a To Do status is moved to one of: %s"
+              % ", ".join(cfg.get("in_progress_names", [])))
+        return
+    print("%-18s %-28s %s" % ("TICKET TYPE", "ONLY WHEN STATUS IS", "MOVE TO"))
+    for name, rule in rules.items():
+        print("%-18s %-28s %s" % (name, " / ".join(as_list(rule.get("from"))),
+                                  " / ".join(as_list(rule.get("to")))))
+    print("Any other type or status is left alone.")
 
 
 def cmd_pause(args, cfg):
@@ -859,7 +931,11 @@ Reading:
   wl jira KEY...           show Jira status;  wl jira start KEY  -> transition only
   wl jira transitions KEY  list the moves Jira allows;  wl jira move KEY "To Do"  -> move it back
 
-Jira is only updated when the hook sees a branch being created (git checkout -b / git switch -c).
+  wl rules                 show which ticket type moves from which status to which
+  wl jira check KEY...     dry run: say what starting the ticket would do, change nothing
+
+Jira is only updated when the hook sees a branch being created (git checkout -b / git switch -c),
+and only when the ticket matches its rule in `wl rules`; otherwise the ticket is not changed at all.
 Switching to an existing branch only logs the ticket. `wl config set jira_trigger any_checkout`
 restores updating on every switch.
 
@@ -923,6 +999,8 @@ def main(argv):
         cmd_setup(cfg)
     elif cmd == "remind":
         cmd_remind(args)
+    elif cmd == "rules":
+        cmd_rules(cfg)
     elif cmd == "pause":
         cmd_pause(args, cfg)
     elif cmd == "resume":

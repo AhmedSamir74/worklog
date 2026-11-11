@@ -21,8 +21,9 @@ It fixes two habits:
 
 1. **Jira never knows you started.** When you **create** a branch whose name contains a
    ticket key (`git checkout -b feature/MAR-45531-rn-upgrade`), a git hook moves the ticket
-   from *To Do* to *In Progress* in Jira and assigns it to you if it is unassigned.
-   Switching to a branch that already exists never touches Jira.
+   to its "in development" status in Jira and assigns it to you if it is unassigned. It only
+   does so when the ticket is in the expected starting status for its type (see
+   [Transition rules](#transition-rules)). Switching to an existing branch never touches Jira.
 2. **You forget what you touched.** Every branch checkout and commit adds the ticket to
    today's log. Things without a branch (PR reviews, validation, meetings) you add with one
    line. `wl report` prints the form above, ready to paste.
@@ -87,12 +88,41 @@ That's it. From now on `git checkout -b feature/MAR-12345-thing` logs the ticket
 
 | Command | Daily log | Jira |
 |---|---|---|
-| `git checkout -b feature/MAR-123-x` or `git switch -c feature/MAR-123-x` | logged | To Do → In Progress, assigned to you if unassigned |
+| `git checkout -b feature/MAR-123-x` or `git switch -c feature/MAR-123-x` | logged | moved per its [transition rule](#transition-rules), assigned to you if unassigned |
 | `git checkout feature/MAR-123-x` (branch already exists locally) | logged | untouched |
 | `git checkout feature/MAR-123-x` (first local copy of a branch that is already on the remote, e.g. a colleague's) | logged | untouched |
 | `git branch feature/MAR-123-x` now, check it out later | logged on checkout | untouched (use `wl start MAR-123`) |
 
-Each created branch triggers Jira exactly once. A ticket that is already past *To Do* is never moved.
+Each created branch triggers Jira exactly once.
+
+### Transition rules
+
+The "in progress" status has a different name per ticket type, and a ticket should only be
+started from one specific status. `wl rules` shows the table in use:
+
+| Ticket type | Only when status is | Move to |
+|---|---|---|
+| Story | Ready For Development | In Development |
+| Bug | Development Queue | In Development |
+| Incident | Dev Queue | In Development |
+| Task | Requests Queue | Task in progress |
+| Technical Change | Ready For Development | In Development |
+
+- A ticket in any other status, or of any other type (Epic, Sub-task, Change, ...), is **not changed
+  at all**: no move and no assignment. The hook log (`~/.local/share/worklog/wl.log`) says why.
+- The same rules apply to `wl start KEY` and `wl jira start KEY`.
+- `wl jira check MAR-123` is a dry run: it prints what would happen and changes nothing.
+- Names are matched ignoring case. `wl jira transitions MAR-123` lists what Jira offers right now.
+
+Change or add a rule (the whole table is one JSON value; `from` may be a list):
+
+```bash
+wl config set transition_rules '{"Story": {"from": "Ready For Development", "to": "In Development"}, "Bug": {"from": ["Development Queue", "Blocked"], "to": "In Development"}}'
+```
+
+A `"*"` entry is a fallback for types without their own rule. On a Jira with the plain
+*To Do → In Progress* workflow, `wl config set transition_rules '{}'` switches to generic mode:
+any ticket still in a To Do status is moved to one of `in_progress_names`.
 Prefer the old behaviour, where every switch can start a ticket? `wl config set jira_trigger any_checkout`.
 
 ---
@@ -128,7 +158,8 @@ Other: `wl log` (what is recorded), `wl report yesterday`, `wl note KEY new text
 wl config show
 wl config set auto_transition false     # log only, never touch Jira
 wl config set assign_to_me false
-wl config set in_progress_names '["In Progress","In Development"]'
+wl config set in_progress_names '["In Progress","In Development"]'   # generic mode only
+wl rules                                # per-type transition rules in use
 wl config set insecure_ssl true         # only if python rejects a corporate certificate
 ```
 
